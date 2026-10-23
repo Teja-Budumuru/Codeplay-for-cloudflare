@@ -1,0 +1,36 @@
+{
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "tsx": "^4.7.1",
+    "turbo": "^2.8.20",
+    "typescript": "^5.3.3",
+    "wrangler": "^4.152.0"
+  },
+  "name": "CodePlay",
+  "version": "1.0.0",
+  "workspaces": [
+    "packages/*",
+    "packages/agents",
+    "packages/model",
+    "packages/model/db",
+    "packages/model/llm",
+    "apps/web"
+  ],
+  "description": "",
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "next": "16.3.6"
+  },
+  "scripts": {
+    "start": "npm run start -w web",
+    "build": "turbo build",
+    "dev": "cd apps/web && npm run dev",
+    "db:generate": "cd packages/model/db && npx drizzle-kit generate",
+    "db:migrate": "cd apps/web && npx wrangler d1 migrations apply codeplay-db --remote"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "packageManager": "npm@11.6.4"
+}

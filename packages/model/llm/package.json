@@ -1,0 +1,25 @@
+{
+  "name": "llm",
+  "version": "1.0.0",
+  "main": "index.ts",
+  "outDir": "dist",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "build": "tsc -b"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "commonjs",
+  "dependencies": {
+    "@google/genai": "^1.0.0",
+    "@openrouter/sdk": "^0.8.0",
+    "db": "*",
+    "openai": "^6.22.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^25.3.0",
+    "typescript": "^5.9.3"
+  }
+}

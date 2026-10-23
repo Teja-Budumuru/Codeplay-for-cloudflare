@@ -1,0 +1,664 @@
+"use client";
+
+import {
+  ClarificationResponse,
+  PlanResponse,
+  BuildResponse,
+  SessionStatus
+} from "@packages/model/types";
+import {
+  createContext,
+  useContext,
+  useState,
+  useCallback,
+  useRef,
+  type ReactNode,
+} from "react";
+
+export interface ChatMessage {
+  id: string;
+  role: "user" | "system" | "agent" | "status";
+  content: string;
+  timestamp: Date;
+  data?: ClarificationResponse | PlanResponse | BuildResponse;
+}
+
+export interface SessionSummary {
+  id: string;
+  prompt: string;
+  status: string;
+  createdAt: string;
+  plan?: PlanResponse | null;
+}
+
+interface GameBuilderState {
+  sessionId: string | null;
+  status: SessionStatus;
+  messages: ChatMessage[];
+  clarification: ClarificationResponse | null;
+  plan: PlanResponse | null;
+  code: BuildResponse | null;
+  streamingCode: string;
+  error: string | null;
+  isLoading: boolean;
+  sessions: SessionSummary[];
+  reviewCount: number;
+}
+
+interface GameBuilderContextType extends GameBuilderState {
+  startNewGame: (prompt: string) => Promise<void>;
+  answerClarification: (answer: string) => Promise<void>;
+  loadSession: (sessionId: string) => Promise<void>;
+  loadSessions: () => Promise<void>;
+  resetGame: () => void;
+  retry: () => void;
+  continueWithFreeTier: () => void;
+}
+
+const GameBuilderContext = createContext<GameBuilderContextType | null>(null);
+
+export function useGameBuilder() {
+  const ctx = useContext(GameBuilderContext);
+  if (!ctx) throw new Error("useGameBuilder must be used within GameBuilderProvider");
+  return ctx;
+}
+
+function generateId() {
+  return Math.random().toString(36).substring(2, 9);
+}
+
+export function GameBuilderProvider({ children, userTier = 'FREE' }: { children: ReactNode; userTier?: 'FREE' | 'PRO' }) {
+  const [state, setState] = useState<GameBuilderState>({
+    sessionId: null,
+    status: "IDLE",
+    messages: [],
+    clarification: null,
+    plan: null,
+    code: null,
+    streamingCode: "",
+    error: null,
+    isLoading: false,
+    sessions: [],
+    reviewCount: 0,
+  });
+
+  const pollingRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isPollingRef = useRef(false);
+  const loadSessionsRef = useRef<() => Promise<void>>(async () => { });
+  const eventSourceRef = useRef<EventSource | null>(null);
+
+  const addMessage = useCallback(
+    (role: ChatMessage["role"], content: string, data?: ChatMessage["data"]) => {
+      setState((prev) => ({
+        ...prev,
+        messages: [
+          ...prev.messages,
+          { id: generateId(), role, content, timestamp: new Date(), data },
+        ],
+      }));
+    },
+    []
+  );
+
+  const startStream = useCallback((sessionId: string) => {
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close()
+      eventSourceRef.current = null;
+    }
+
+    setState((prev) => ({
+      ...prev,
+      streamingCode: "",
+      isLoading: true,
+      status: "BUILDING",
+    }))
+
+    if (userTier === 'FREE') {
+      addMessage("status", "Generating game code using free models... (Note: Generating complex code on the free tier may take more time than usual. Upgrade to Pro for faster speeds.)");
+    } else {
+      addMessage("status", "connecting to agent to start building....");
+    }
+
+    const es = new EventSource(`/api/stream?sessionId=${sessionId}`);
+    eventSourceRef.current = es;
+
+    let timeoutId: NodeJS.Timeout;
+
+    const resetTimeout = () => {
+      if (timeoutId) clearTimeout(timeoutId);
+      timeoutId = setTimeout(() => {
+        if (es.readyState !== EventSource.CLOSED) {
+          es.close();
+          setState((prev) => ({
+            ...prev,
+            status: 'FAILED',
+            error: "Stream connection timed out due to inactivity",
+            isLoading: false
+          }));
+          addMessage('system', 'Stream connection timed out. Please try again.');
+          eventSourceRef.current = null;
+        }
+      }, 300000); // 5 minutes
+    };
+
+    resetTimeout();
+
+    const safeParse = <T = any>(data: string): T | null => {
+      try {
+        return JSON.parse(data);
+      } catch (err) {
+        console.warn("[SSE] Failed to parse event payload:", err, data);
+        return null;
+      }
+    };
+
+    es.addEventListener("code_chunk", (e) => {
+      resetTimeout();
+      const parsed = safeParse<{ chunk: string }>(e.data);
+      if (!parsed?.chunk) return;
+      setState((prev) => ({
+        ...prev,
+        streamingCode: prev.streamingCode + parsed.chunk,
+        status: 'BUILDING'
+      }));
+    });
+
+    es.addEventListener("status", (e) => {
+      resetTimeout();
+      const parsed = safeParse<{ status: string; attempt?: number; max?: number; isRetry?: boolean; message?: string }>(e.data);
+      if (!parsed) return;
+      const { status, attempt, max, isRetry, message } = parsed;
+      setState((prev) => ({
+        ...prev,
+        status: status as SessionStatus,
+        reviewCount: attempt || prev.reviewCount
+      }));
+
+      if (isRetry && message) {
+        addMessage("status", message);
+      }
+      else if (status === 'REVIEW') {
+        addMessage("status", `Code Reviewer reviewing the code${attempt ? ` (attempt ${attempt}/${max})` : '...'}`);
+      }
+      else if (status === 'REBUILD') {
+        addMessage("status", `Issue found, resolving the issues ${attempt ? `(attempt ${attempt}/${max})` : "..."} `);
+        setState((prev) => ({ ...prev, streamingCode: "", }));
+      }
+    });
+
+    es.addEventListener("review_result", (e) => {
+      resetTimeout();
+      const parsed = safeParse<{ passed: boolean; issues?: any[] }>(e.data);
+      if (!parsed) return;
+      const { passed, issues } = parsed;
+      if (passed) {
+        addMessage("status", 'code review passed ');
+      }
+      else {
+        addMessage('status', `Reviewer found ${issues?.length ?? 0} issues(s) - fixing...`);
+      }
+    });
+
+    es.addEventListener("complete", (e) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      const parsed = safeParse<{ code: string; model?: string }>(e.data);
+      const code = parsed?.code || '';
+      const model = parsed?.model || '';
+      setState((prev) => ({
+        ...prev,
+        status: "COMPLETED",
+        code: { code, model },
+        streamingCode: "",
+        isLoading: false
+      }));
+
+      addMessage('agent', 'Your game is ready, check the Code and Preview tabs');
+      void loadSessionsRef.current();
+      es.close();
+      eventSourceRef.current = null;
+    });
+
+    es.addEventListener("error", (e) => {
+      if (timeoutId) clearTimeout(timeoutId);
+      if (es.readyState === EventSource.CLOSED) {
+        setState((prev) => ({
+          ...prev,
+          status: 'FAILED',
+          error: "stream connection lost",
+          isLoading: false
+        }))
+        addMessage('system', 'Stream connection lost, please try again');
+        eventSourceRef.current = null;
+      }
+      else {
+        try {
+          const { message } = JSON.parse((e as MessageEvent).data);
+          setState((prev) => ({
+            ...prev,
+            status: 'FAILED',
+            error: message,
+            isLoading: false
+          }))
+
+          addMessage('system', `Build Failed ${message}`)
+        }
+        catch {
+          setState((prev) => ({
+            ...prev,
+            status: 'FAILED',
+            error: "Unknown error",
+            isLoading: false
+          }))
+          addMessage('system', "Build Failed: Unknown error")
+        }
+        finally {
+          es.close();
+          eventSourceRef.current = null;
+        }
+      }
+    })
+
+
+  }, [addMessage]);
+
+  const stopPolling = useCallback(() => {
+    isPollingRef.current = false;
+    if (pollingRef.current) {
+      clearTimeout(pollingRef.current);
+      pollingRef.current = null;
+    }
+  }, []);
+
+  const callChatApi = useCallback(
+    async (body: { sessionId?: string; message?: string; prompt?: string }) => {
+      const res = await fetch("/api/chat", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(body),
+      });
+
+      if (!res.ok) {
+        const err = await res.json().catch(() => ({ error: "Request failed" }));
+        throw new Error(err.error || "Request failed");
+      }
+
+      return res.json();
+    },
+    []
+  );
+
+  const pollNext = useCallback(
+    (sessionId: string) => {
+      if (isPollingRef.current) return;
+      isPollingRef.current = true;
+
+      const doPoll = async () => {
+        if (!isPollingRef.current) return;
+        try {
+          setState((prev) => ({ ...prev, isLoading: true }));
+          const result = await callChatApi({ sessionId });
+          isPollingRef.current = false;
+          pollingRef.current = null;
+          processResponse(result);
+          void loadSessionsRef.current();
+        } catch (err) {
+          setState((prev) => ({
+            ...prev,
+            isLoading: false,
+            status: "FAILED",
+            error: err instanceof Error ? err.message : "Unknown error",
+          }));
+          addMessage(
+            "system",
+            `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+          );
+          stopPolling();
+        }
+      };
+      pollingRef.current = setTimeout(doPoll, 2000);
+    },
+    [callChatApi, addMessage, stopPolling]
+  );
+
+  const processResponse = useCallback(
+    (result: { type: string; data: unknown; sessionId: string }) => {
+      const { type, data, sessionId } = result;
+
+      setState((prev) => ({ ...prev, sessionId, isLoading: false }));
+
+      switch (type) {
+        case "INIT":
+        case "CLARIFYING": {
+          const clarification = data as ClarificationResponse;
+          if (clarification.isSufficient) {
+            // Check for Pro Upgrade interstitial
+            if (userTier === 'FREE' && (clarification.complexityTier === 'tier2' || clarification.complexityTier === 'tier3')) {
+                setState((prev) => ({
+                    ...prev,
+                    status: "AWAITING_UPGRADE_DECISION",
+                    clarification,
+                }));
+                 addMessage("status", "Complexity detected! Upgrading to Pro will use Gemini Pro for better reasoning and faster results compared to the free tier models.");
+            } else {
+                setState((prev) => ({
+                    ...prev,
+                    status: "PLANNING",
+                    clarification,
+                }));
+                addMessage("status", "Requirements clarified! Planning your game...");
+                pollNext(sessionId);
+            }
+          } else {
+            setState((prev) => ({
+              ...prev,
+              status: "CLARIFYING",
+              clarification,
+            }));
+            addMessage(
+              "agent",
+              "I have a few questions to design your game:",
+              clarification
+            );
+          }
+          break;
+        }
+
+        case "PLANNING": {
+          const plan = data as PlanResponse;
+          setState((prev) => ({
+            ...prev,
+            status: "BUILDING",
+            plan,
+          }));
+          addMessage(
+            "status",
+            `Plan ready: "${plan.title}" — Now generating code...`
+          );
+          pollNext(sessionId);
+          break;
+        }
+
+        case "STREAM_REQUIRED": {
+          startStream(sessionId);
+          break;
+        }
+
+        case "COMPLETED": {
+          const code = data as BuildResponse;
+          setState((prev) => ({
+            ...prev,
+            status: "COMPLETED",
+            code,
+          }));
+          stopPolling();
+          break;
+        }
+
+        case "ERROR": {
+          setState((prev) => ({
+            ...prev,
+            status: "FAILED",
+            error: data as string,
+          }));
+          addMessage("system", `Error: ${data}`);
+          stopPolling();
+          break;
+        }
+      }
+    },
+    [addMessage, stopPolling, startStream, pollNext, userTier]
+  );
+
+  const startNewGame = useCallback(
+    async (prompt: string) => {
+      stopPolling();
+      setState((prev) => ({
+        ...prev,
+        sessionId: null,
+        status: "INIT",
+        messages: [],
+        clarification: null,
+        plan: null,
+        code: null,
+        error: null,
+        isLoading: true,
+        reviewCount: 0,
+      }));
+
+      addMessage("user", prompt);
+      addMessage("status", "Analyzing your game idea...");
+
+      try {
+        const result = await callChatApi({ prompt });
+        processResponse(result);
+        void loadSessionsRef.current();
+      } catch (err) {
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          status: "FAILED",
+          error: err instanceof Error ? err.message : "Unknown error",
+        }));
+        addMessage(
+          "system",
+          `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+        );
+      }
+    },
+    [callChatApi, processResponse, addMessage, stopPolling]
+  );
+
+  const answerClarification = useCallback(
+    async (answer: string) => {
+      if (!state.sessionId) return;
+
+      addMessage("user", answer);
+      setState((prev) => ({ ...prev, isLoading: true }));
+
+      try {
+        const result = await callChatApi({
+          sessionId: state.sessionId,
+          message: answer,
+        });
+        processResponse(result);
+      } catch (err) {
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          status: "FAILED",
+          error: err instanceof Error ? err.message : "Unknown error",
+        }));
+        addMessage(
+          "system",
+          `Error: ${err instanceof Error ? err.message : "Unknown error"}`
+        );
+      }
+    },
+    [state.sessionId, callChatApi, processResponse, addMessage]
+  );
+
+  const loadSession = useCallback(
+    async (sessionId: string) => {
+      stopPolling();
+      setState((prev) => ({
+        ...prev,
+        sessionId,
+        status: "INIT",
+        messages: [],
+        clarification: null,
+        plan: null,
+        code: null,
+        error: null,
+        isLoading: true,
+        reviewCount: 0,
+      }));
+
+      try {
+        const res = await fetch(`/api/sessions/${sessionId}`);
+        if (!res.ok) throw new Error("Failed to load session");
+        const session = await res.json();
+
+        const messages: ChatMessage[] = [];
+        messages.push({
+          id: generateId(),
+          role: "user",
+          content: session.prompt,
+          timestamp: new Date(session.createdAt),
+        });
+
+        if (session.clarification) {
+          const clar = session.clarification as ClarificationResponse;
+          if (clar.questions?.length) {
+            messages.push({
+              id: generateId(),
+              role: "agent",
+              content: "Previous Questions",
+              timestamp: new Date(session.createdAt),
+              data: clar,
+            });
+          }
+        }
+
+        if (session.plan) {
+          const plan = session.plan as PlanResponse;
+          messages.push({
+            id: generateId(),
+            role: "status",
+            content: `Plan: "${plan.title}"`,
+            timestamp: new Date(session.createdAt),
+          });
+        }
+
+        let status: SessionStatus = session.status as SessionStatus;
+        let shouldPoll = session.status === 'PLANNING';
+
+        if (status === 'CLARIFYING') {
+          const clar = session.clarification as ClarificationResponse | null;
+          if (clar?.isSufficient) {
+            status = 'PLANNING';
+            shouldPoll = true;
+          } else if (!clar || !clar.questions || clar.questions.length === 0) {
+            shouldPoll = true;
+          }
+        }
+
+        if (session.code && session.status === "COMPLETED") {
+          messages.push({
+            id: generateId(),
+            role: "agent",
+            content: `Game completed!`,
+            timestamp: new Date(session.createdAt),
+            data: session.code as BuildResponse,
+          });
+        }
+
+        setState((prev) => ({
+          ...prev,
+          sessionId,
+          status: status === "INIT" ? "IDLE" : status,
+          messages,
+          clarification: (session.clarification as ClarificationResponse) || null,
+          plan: (session.plan as PlanResponse) || null,
+          code: session.status === "COMPLETED" ? (session.code as BuildResponse) : null,
+          error: session.error || null,
+          isLoading: shouldPoll ? true : false,
+          reviewCount: session.reviewCount || 0,
+        }));
+
+        if (shouldPoll) {
+          pollNext(sessionId);
+        }
+        else if (['BUILDING', 'REVIEW', 'REBUILD'].includes(session.status)) {
+          addMessage('status', 'Resuming build from where we left off...')
+          startStream(sessionId)
+        }
+      } catch (err) {
+        setState((prev) => ({
+          ...prev,
+          isLoading: false,
+          error: err instanceof Error ? err.message : "Unknown error",
+        }));
+      }
+    },
+    [stopPolling, pollNext, startStream, addMessage]
+  );
+
+  const loadSessions = useCallback(async () => {
+    try {
+      const res = await fetch("/api/sessions");
+      if (!res.ok) return;
+      const data = await res.json();
+      setState((prev) => ({ ...prev, sessions: data }));
+    } catch { }
+  }, []);
+
+  loadSessionsRef.current = loadSessions;
+
+  const resetGame = useCallback(() => {
+    stopPolling();
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
+    setState((prev) => ({
+      ...prev,
+      sessionId: null,
+      status: "IDLE",
+      messages: [],
+      clarification: null,
+      plan: null,
+      code: null,
+      error: null,
+      streamingCode: "",
+      isLoading: false,
+      reviewCount: 0,
+    }));
+  }, [stopPolling]);
+
+  const retry = useCallback(() => {
+    if (!state.sessionId) return;
+    const nextStatus = state.plan ? "BUILDING" : "PLANNING";
+    setState((prev) => ({
+      ...prev,
+      error: null,
+      isLoading: true,
+      status: nextStatus
+    }));
+
+    if (state.plan) {
+      addMessage("status", "Retrying game build...");
+      startStream(state.sessionId);
+    } else {
+      addMessage("status", "Retrying planning phase...");
+      pollNext(state.sessionId);
+    }
+  }, [state.sessionId, state.plan, startStream, pollNext, addMessage]);
+
+  const continueWithFreeTier = useCallback(() => {
+    if (!state.sessionId || state.status !== "AWAITING_UPGRADE_DECISION") return;
+    
+    setState((prev) => ({
+      ...prev,
+      status: "PLANNING"
+    }));
+     addMessage("status", "Proceeding with free models. Planning your game... (Note: Generating complex code on the free tier may take more time than usual. Upgrade to Pro for faster speeds.)");
+    pollNext(state.sessionId);
+  }, [state.sessionId, state.status, pollNext, addMessage]);
+
+  return (
+    <GameBuilderContext.Provider
+      value={{
+        ...state,
+        startNewGame,
+        answerClarification,
+        loadSession,
+        loadSessions,
+        resetGame,
+        retry,
+        continueWithFreeTier
+      }}
+    >
+      {children}
+    </GameBuilderContext.Provider>
+  );
+}

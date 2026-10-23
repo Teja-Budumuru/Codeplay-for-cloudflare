@@ -1,0 +1,123 @@
+import NextAuth from "next-auth";
+import Google from "next-auth/providers/google";
+import Credentials from "next-auth/providers/credentials";
+import { getDb } from "@/lib/db";
+import { users } from "@packages/model/db/schema";
+import { headers } from "next/headers";
+
+function normalizeText(raw?: string | null): string | undefined {
+  if (!raw) return undefined;
+  try {
+    const decoded = decodeURIComponent(raw);
+    const normalizedText = Buffer.from(decoded, 'latin1').toString('utf8')
+      .normalize('NFD').replace(/[\u0300-\u036f]/g, "").trim();
+    return normalizedText
+  }
+  catch (e) {
+    return raw
+  }
+}
+export const { handlers, signIn, signOut, auth } = NextAuth({
+  // No PrismaAdapter — Credentials provider is incompatible with it in NextAuth v5 JWT mode.
+  // User persistence is handled manually in the signIn callback below.
+  trustHost: true,
+  useSecureCookies: true,
+  secret: process.env.AUTH_SECRET || process.env.NEXTAUTH_SECRET,
+  debug: true,
+  session: {
+    strategy: "jwt",
+  },
+  pages: {
+    signIn: "/login",
+    newUser: "/builder",
+    error: "/login",
+  },
+  providers: [
+    Google({
+      clientId: process.env.GOOGLE_CLIENT_ID!,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET!,
+      checks: ['state'],
+    }),
+    Credentials({
+      id: "guest",
+      name: "Guest",
+      credentials: {
+        name: { label: "Name", type: "text" }
+      },
+      async authorize(credentials) {
+        // Return a static mock user object, no DB upsert to prevent spam
+        return {
+          id: "guest-jwt",
+          email: "guest@example.com",
+          name: (credentials?.name as string) || "Guest User",
+        };
+      },
+    }),
+  ],
+  callbacks: {
+    async signIn({ user, account, profile }) {
+      // For Google OAuth — upsert the user in our DB manually (no adapter)
+      if (account?.provider === "google" && profile?.email) {
+        try {
+          const headerList = await headers();
+          const country = headerList.get("cf-ipcountry") || undefined;
+          const city = normalizeText(headerList.get("cf-ipcity") || null);
+          const region = normalizeText(headerList.get("cf-region") || null);
+          const db = await getDb();
+          const [dbUser] = await db
+            .insert(users)
+            .values({
+              email: profile.email,
+              name: profile.name ?? null,
+              image: (profile as Record<string, string>).picture ?? null,
+              country: country ?? undefined,
+              city: [city, region].filter(Boolean).join(", ") || undefined,
+              emailVerified: new Date(),
+            })
+            .onConflictDoUpdate({
+              target: users.email,
+              set: {
+                name: profile.name ?? undefined,
+                image: (profile as Record<string, string>).picture ?? undefined,
+                country: country ?? undefined,
+                city: [city, region].filter(Boolean).join(", ") || undefined,
+              },
+            })
+            .returning({ id: users.id });
+          if (dbUser) user.id = dbUser.id;
+        } catch (err) {
+          console.error("[Google signIn] DB upsert failed:", err);
+          return false;
+        }
+      }
+      return true;
+    },
+    async jwt({ token, user }) {
+      if (user) {
+        token.userId = user.id;
+        token.email = user.email;
+        token.name = user.name;
+        // If it's the guest user, flag it in the token
+        if (user.id === "guest-jwt") {
+          token.isGuest = true;
+        }
+      }
+      return token;
+    },
+    async session({ session, token }) {
+      if (token.userId) {
+        session.user.id = token.userId as string;
+      }
+      if (token.email) {
+        session.user.email = token.email as string;
+      }
+      if (token.name) {
+        session.user.name = token.name as string;
+      }
+      if (token.isGuest) {
+        (session.user as any).isGuest = true;
+      }
+      return session;
+    },
+  },
+});

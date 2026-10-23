@@ -1,0 +1,29 @@
+{
+    "$schema": "node_modules/wrangler/config-schema.json",
+    "name": "codeplay",
+    "main": ".open-next/worker.js",
+    "compatibility_date": "2026-10-25",
+    "compatibility_flags": [
+        "nodejs_compat"
+    ],
+    "assets": {
+        "directory": ".open-next/assets",
+        "binding": "ASSETS"
+    },
+    "kv_namespaces": [
+        {
+            "binding": "LLM_CACHE",
+            "id": "4070aad559304efc843f9ff4725d00b4",
+            "remote": true
+        }
+    ],
+    "d1_databases": [
+        {
+            "binding": "DB",
+            "database_name": "codeplay-db",
+            "database_id": "8e29c6cd-06bb-42f9-b980-f203890fe3cd",
+            "remote": true,
+            "migrations_dir": "../../packages/model/db/migrations"
+        }
+    ]
+}
